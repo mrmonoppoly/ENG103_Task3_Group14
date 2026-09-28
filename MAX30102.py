@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
 """
-max30102_reader.py
 
 Reads a MAX30102 pulse-oximeter/heart-rate sensor over I2C on a Raspberry Pi,
 and continuously estimates:
@@ -9,18 +7,25 @@ and continuously estimates:
 
 These are kept up to date in a background thread and exposed as plain
 attributes (`monitor.bpm`, `monitor.spo2`) so other scripts can import this
-module and read them at any time.
+module and read them at any time. Both are None when there is no finger, no
+detectable pulse, or the sensor can't be read.
 
 IMPORTANT: This uses a simple peak-detection / ratio-of-ratios algorithm.
 It is fine for hobby projects but is NOT a medical device and should not be
-used for health/medical decisions. Thresholds (PEAK_THRESHOLD, FINGER_THRESHOLD)
-may need tuning for your specific sensor, finger, and skin tone/lighting.
+used for health/medical decisions.
+
+Tuning: run this file directly and watch "pulse amp". With a good finger
+placement it should be a few hundred counts or more. If it is tiny, raise the
+LED current (led_current in MAX30102._setup) or press slightly firmer/lighter.
+MIN_PEAK_AMPLITUDE should sit well above the amp you see with the finger on
+but no pulse (noise) and well below the amp with a good pulse.
 
 Wiring (3.3V logic, Pi GPIO header):
     MAX30102 VIN -> Pi 3.3V (pin 1)
     MAX30102 GND -> Pi GND  (pin 6)
     MAX30102 SDA -> Pi SDA1 (pin 3, GPIO2)
     MAX30102 SCL -> Pi SCL1 (pin 5, GPIO3)
+    (INT is not used)
 
 Setup on the Pi:
     sudo raspi-config          # Interface Options -> I2C -> Enable
@@ -38,18 +43,15 @@ Use from another script:
     import time
 
     monitor = start_monitoring()
-    time.sleep(3)               # give it a few seconds to get a stable reading
+    time.sleep(5)               # give it a few seconds to get a stable reading
     print(monitor.bpm, monitor.spo2)
-
-    while True:
-        if monitor.finger_detected:
-            print(f"BPM={monitor.bpm} SpO2={monitor.spo2}")
-        time.sleep(1)
 """
 
 import argparse
 import collections
 import csv
+import math
+import statistics
 import sys
 import threading
 import time
@@ -110,7 +112,7 @@ class MAX30102:
         self._write(REG_MODE_CONFIG, 0x40)  # reset bit
         time.sleep(0.1)
 
-    def _setup(self, red_current=0x24, ir_current=0x24):
+    def _setup(self, red_current=0x10, ir_current=0x10):
         self._write(REG_FIFO_WR_PTR, 0x00)
         self._write(REG_FIFO_OVF_COUNTER, 0x00)
         self._write(REG_FIFO_RD_PTR, 0x00)
@@ -124,6 +126,11 @@ class MAX30102:
 
         self._write(REG_INT_ENABLE_1, 0x00)
         self._write(REG_INT_ENABLE_2, 0x00)
+
+    def reinit(self):
+        """Reset and reconfigure the sensor (used to recover after an I2C error)."""
+        self._reset()
+        self._setup()
 
     def part_id(self):
         return self._read(REG_PART_ID)
@@ -158,30 +165,55 @@ class HeartRateSpO2Monitor:
     continuously up to date.
     """
 
-    SAMPLE_RATE_HZ = 100          # matches SAMPLE_RATE_100 config above
-    BUFFER_SECONDS = 4            # rolling window used for SpO2 calc
-    FINGER_THRESHOLD = 50000      # raw IR DC value below this => no finger present
-    PEAK_THRESHOLD = 200          # min AC amplitude to count as a heartbeat pulse
-    MIN_PEAK_INTERVAL = 0.3       # seconds between beats (caps BPM at 200)
-    SPO2_UPDATE_INTERVAL = 1.0    # seconds between SpO2 recalculations
+    SAMPLE_RATE_HZ = 100            # matches SAMPLE_RATE_100 config above
+    BUFFER_SECONDS = 4              # rolling window used for SpO2 calc
+    FINGER_THRESHOLD = 50000        # raw IR DC value below this => no finger present
+    BASELINE_ALPHA = 0.02           # DC baseline tracking speed
+    SMOOTH_SAMPLES = 5              # moving-average length (~50 ms) to reduce noise
+    SETTLE_SECONDS = 3.0            # ignore the signal this long after a finger appears
 
-    def __init__(self, bus_number=1):
-        self.sensor = MAX30102(bus_number=bus_number)
+    MIN_PEAK_AMPLITUDE = 100        # floor for the peak threshold (raw ADC counts)
+    PEAK_THRESHOLD_FRACTION = 0.5   # peaks must reach this fraction of the recent max
+    MIN_PEAK_INTERVAL = 0.3         # seconds between beats (caps BPM at 200)
+    MAX_PEAK_INTERVAL = 1.5         # longer gap = missed beat (below 40 BPM); restart averaging
+    MIN_INTERVALS = 3               # beats needed before a BPM is reported
+    PULSE_TIMEOUT = 3.0             # seconds without a beat before BPM/SpO2 are cleared
+    SPO2_TIMEOUT = 5.0              # seconds without a valid SpO2 update before it is cleared
+
+    SPO2_UPDATE_INTERVAL = 1.0      # seconds between SpO2 recalculations
+    SPO2_MIN_R = 0.2                # plausible ratio-of-ratios range; outside = artifact
+    SPO2_MAX_R = 1.0
+
+    def __init__(self, bus_number=1, sensor=None):
+        self.sensor = sensor if sensor is not None else MAX30102(bus_number=bus_number)
 
         maxlen = int(self.SAMPLE_RATE_HZ * self.BUFFER_SECONDS)
         self._ir_buffer = collections.deque(maxlen=maxlen)
         self._red_buffer = collections.deque(maxlen=maxlen)
+        self._ir_ac_buffer = collections.deque(maxlen=maxlen)
+        self._red_ac_buffer = collections.deque(maxlen=maxlen)
+        self._recent_ac = collections.deque(maxlen=self.SAMPLE_RATE_HZ * 2)
+        self._ir_smooth = collections.deque(maxlen=self.SMOOTH_SAMPLES)
+        self._red_smooth = collections.deque(maxlen=self.SMOOTH_SAMPLES)
+        self._ac_hist = collections.deque(maxlen=3)
+        self._intervals = collections.deque(maxlen=5)
+        self._spo2_history = collections.deque(maxlen=5)
 
-        self._peak_times = collections.deque(maxlen=6)
-        self._last_peak_time = 0.0
-        self._running_avg_ir = None
+        self._sample_count = 0
+        self._last_peak_sample = None
+        self._last_spo2_sample = None
+        self._ir_baseline = None
+        self._red_baseline = None
+        self._settle_until = 0
 
         # Public, thread-safe-ish values other code can read directly.
         self.bpm = None            # float BPM, or None until enough data
         self.spo2 = None           # float percent, or None until enough data
         self.red = 0
         self.ir = 0
+        self.ac_amp = 0.0          # recent pulse amplitude (raw counts), useful for tuning
         self.finger_detected = False
+        self.last_error = None     # set if the I2C read fails
 
         self._lock = threading.Lock()
         self._thread = None
@@ -205,9 +237,24 @@ class HeartRateSpO2Monitor:
         poll_interval = 1.0 / self.SAMPLE_RATE_HZ
         last_spo2_calc = 0.0
         while not self._stop_flag.is_set():
-            for red, ir in self.sensor.read_fifo():
-                now = time.time()
-                self._process_sample(red, ir, now)
+            try:
+                for red, ir in self.sensor.read_fifo():
+                    self._process_sample(red, ir)
+                self.last_error = None
+            except OSError as e:
+                # I2C hiccup: don't die silently and leave old readings frozen.
+                self.last_error = str(e)
+                self.finger_detected = False
+                self._clear_readings()
+                self._reset_tracking()
+                time.sleep(0.5)
+                try:
+                    self.sensor.reinit()  # sensor may have lost power/config
+                except (OSError, AttributeError):
+                    pass  # still unreachable; try again on the next loop
+                continue
+
+            self._expire_stale()
 
             now = time.time()
             if now - last_spo2_calc > self.SPO2_UPDATE_INTERVAL:
@@ -216,77 +263,151 @@ class HeartRateSpO2Monitor:
 
             time.sleep(poll_interval)
 
+    # -- state helpers ------------------------------------------------
+    def _clear_readings(self):
+        with self._lock:
+            self.bpm = None
+            self.spo2 = None
+
+    def _reset_tracking(self):
+        """Forget all signal history (finger removed or sensor error)."""
+        for d in (self._ir_buffer, self._red_buffer, self._ir_ac_buffer,
+                  self._red_ac_buffer, self._recent_ac, self._ir_smooth,
+                  self._red_smooth, self._ac_hist, self._intervals,
+                  self._spo2_history):
+            d.clear()
+        self._ir_baseline = None
+        self._red_baseline = None
+        self._last_peak_sample = None
+        self._last_spo2_sample = None
+        self.ac_amp = 0.0
+
+    def _expire_stale(self):
+        """Clear readings that haven't been refreshed, so old values aren't repeated forever."""
+        sr = self.SAMPLE_RATE_HZ
+        if self.bpm is not None and self._last_peak_sample is not None:
+            if (self._sample_count - self._last_peak_sample) / sr > self.PULSE_TIMEOUT:
+                self._clear_readings()
+                self._intervals.clear()
+                self._spo2_history.clear()
+                return
+        if self.spo2 is not None and self._last_spo2_sample is not None:
+            if (self._sample_count - self._last_spo2_sample) / sr > self.SPO2_TIMEOUT:
+                with self._lock:
+                    self.spo2 = None
+                self._spo2_history.clear()
+
     # -- per-sample processing ------------------------------------------
-    def _process_sample(self, red, ir, timestamp):
+    def _process_sample(self, red, ir):
+        self._sample_count += 1
         self.red = red
         self.ir = ir
-        self._ir_buffer.append(ir)
-        self._red_buffer.append(red)
 
         self.finger_detected = ir > self.FINGER_THRESHOLD
         if not self.finger_detected:
-            with self._lock:
-                self.bpm = None
-                self.spo2 = None
-            self._peak_times.clear()
-            self._running_avg_ir = None
+            self._clear_readings()
+            self._reset_tracking()
             return
 
-        # Exponential moving average tracks the slow-changing DC baseline;
-        # the difference (baseline - ir) is the AC pulsatile component,
-        # which spikes upward on each heartbeat (light absorption dips).
-        alpha = 0.01
-        if self._running_avg_ir is None:
-            self._running_avg_ir = ir
+        # Exponential moving averages track the slow-changing DC baselines.
+        # (baseline - value) is the AC pulsatile component, which rises on
+        # each heartbeat (more blood = more absorption = less reflected light).
+        alpha = self.BASELINE_ALPHA
+        if self._ir_baseline is None:
+            self._ir_baseline = ir
+            self._red_baseline = red
+            self._settle_until = self._sample_count + int(self.SETTLE_SECONDS * self.SAMPLE_RATE_HZ)
         else:
-            self._running_avg_ir = alpha * ir + (1 - alpha) * self._running_avg_ir
-        ac_value = self._running_avg_ir - ir
+            self._ir_baseline = alpha * ir + (1 - alpha) * self._ir_baseline
+            self._red_baseline = alpha * red + (1 - alpha) * self._red_baseline
 
-        self._detect_peak(ac_value, timestamp)
+        self._ir_smooth.append(self._ir_baseline - ir)
+        self._red_smooth.append(self._red_baseline - red)
+        ir_ac = sum(self._ir_smooth) / len(self._ir_smooth)
+        red_ac = sum(self._red_smooth) / len(self._red_smooth)
 
-    def _detect_peak(self, ac_value, timestamp):
-        if ac_value > self.PEAK_THRESHOLD and (timestamp - self._last_peak_time) > self.MIN_PEAK_INTERVAL:
-            self._last_peak_time = timestamp
-            self._peak_times.append(timestamp)
-            if len(self._peak_times) >= 2:
-                pts = list(self._peak_times)
-                intervals = [t2 - t1 for t1, t2 in zip(pts, pts[1:])]
-                avg_interval = sum(intervals) / len(intervals)
-                if avg_interval > 0:
-                    with self._lock:
-                        self.bpm = round(60.0 / avg_interval, 1)
+        if self._sample_count < self._settle_until:
+            return  # still settling after the finger was placed
+
+        self._ir_buffer.append(ir)
+        self._red_buffer.append(red)
+        self._ir_ac_buffer.append(ir_ac)
+        self._red_ac_buffer.append(red_ac)
+        self._recent_ac.append(ir_ac)
+        self.ac_amp = max(self._recent_ac) - min(self._recent_ac)
+
+        self._detect_peak(ir_ac)
+
+    def _detect_peak(self, value):
+        """Detect local maxima that clear an adaptive threshold; time them by sample count."""
+        self._ac_hist.append(value)
+        if len(self._ac_hist) < 3:
+            return
+        a, b, c = self._ac_hist  # b is the middle (previous) sample
+        threshold = max(self.MIN_PEAK_AMPLITUDE,
+                        self.PEAK_THRESHOLD_FRACTION * max(self._recent_ac))
+        if not (b > a and b >= c and b > threshold):
+            return
+
+        peak_sample = self._sample_count - 1
+        if self._last_peak_sample is None:
+            self._last_peak_sample = peak_sample
+            return
+
+        interval = (peak_sample - self._last_peak_sample) / self.SAMPLE_RATE_HZ
+        if interval < self.MIN_PEAK_INTERVAL:
+            return  # too soon: noise or dicrotic notch, keep the earlier beat
+        self._last_peak_sample = peak_sample
+        if interval > self.MAX_PEAK_INTERVAL:
+            self._intervals.clear()  # missed a beat; start averaging again
+            return
+
+        self._intervals.append(interval)
+        if len(self._intervals) >= self.MIN_INTERVALS:
+            median_interval = statistics.median(self._intervals)
+            with self._lock:
+                self.bpm = round(60.0 / median_interval, 1)
 
     def _update_spo2(self):
-        ir_vals = list(self._ir_buffer)
-        red_vals = list(self._red_buffer)
-
-        if len(ir_vals) < self.SAMPLE_RATE_HZ or not self.finger_detected:
+        # Only trust SpO2 while a pulse is actually being tracked.
+        if not self.finger_detected or self.bpm is None:
+            return
+        n = len(self._ir_ac_buffer)
+        if n < self.SAMPLE_RATE_HZ * 2:
             return
 
-        ir_dc = sum(ir_vals) / len(ir_vals)
-        red_dc = sum(red_vals) / len(red_vals)
-        ir_ac = (max(ir_vals) - min(ir_vals)) / 2.0
-        red_ac = (max(red_vals) - min(red_vals)) / 2.0
+        ir_ac_vals = list(self._ir_ac_buffer)
+        red_ac_vals = list(self._red_ac_buffer)
+        ir_rms = math.sqrt(sum(x * x for x in ir_ac_vals) / len(ir_ac_vals))
+        red_rms = math.sqrt(sum(x * x for x in red_ac_vals) / len(red_ac_vals))
+        ir_dc = sum(self._ir_buffer) / len(self._ir_buffer)
+        red_dc = sum(self._red_buffer) / len(self._red_buffer)
 
-        if ir_dc == 0 or red_dc == 0 or ir_ac == 0:
+        if ir_dc == 0 or red_dc == 0 or ir_rms == 0:
             return
 
         # Standard ratio-of-ratios approach with Maxim's empirical calibration curve.
-        R = (red_ac / red_dc) / (ir_ac / ir_dc)
+        R = (red_rms / red_dc) / (ir_rms / ir_dc)
+        if not (self.SPO2_MIN_R <= R <= self.SPO2_MAX_R):
+            return  # implausible ratio = motion/noise artifact, skip this update
+
         spo2 = -45.060 * (R ** 2) + 30.354 * R + 94.845
         spo2 = max(0.0, min(100.0, spo2))
 
+        self._spo2_history.append(spo2)
+        self._last_spo2_sample = self._sample_count
         with self._lock:
-            self.spo2 = round(spo2, 1)
+            self.spo2 = round(sum(self._spo2_history) / len(self._spo2_history), 1)
 
     def get_readings(self):
-        """Return a snapshot dict: bpm, spo2, red, ir, finger_detected."""
+        """Return a snapshot dict: bpm, spo2, red, ir, ac_amp, finger_detected."""
         with self._lock:
             return {
                 "bpm": self.bpm,
                 "spo2": self.spo2,
                 "red": self.red,
                 "ir": self.ir,
+                "ac_amp": self.ac_amp,
                 "finger_detected": self.finger_detected,
             }
 
@@ -350,12 +471,16 @@ def main():
     try:
         while True:
             r = monitor.get_readings()
-            if not r["finger_detected"]:
-                print("No finger detected...")
+            extra = f"(IR={r['ir']}, pulse amp={r['ac_amp']:.0f})"
+            if monitor.last_error:
+                print(f"Sensor read error: {monitor.last_error}")
+            elif not r["finger_detected"]:
+                print(f"No finger detected...   {extra}")
+            elif r["bpm"] is None:
+                print(f"Finger detected, waiting for a pulse...   {extra}")
             else:
-                bpm_str = f"{r['bpm']:.1f}" if r["bpm"] is not None else "calculating..."
                 spo2_str = f"{r['spo2']:.1f}%" if r["spo2"] is not None else "calculating..."
-                print(f"BPM: {bpm_str:>10}   SpO2: {spo2_str:>10}   (raw IR={r['ir']})")
+                print(f"BPM: {r['bpm']:>6.1f}   SpO2: {spo2_str:>14}   {extra}")
 
             if csv_writer:
                 csv_writer.writerow([f"{time.time():.3f}", r["bpm"], r["spo2"], r["red"], r["ir"], r["finger_detected"]])
