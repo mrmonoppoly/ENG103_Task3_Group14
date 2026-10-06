@@ -7,6 +7,7 @@ Run the following:
 - sudo raspi-config                 # Interface Options -> I2C -> Enable, then reboot
 - sudo apt install -y python3-smbus i2c-tools
 - pip3 install smbus2 dropbox --break-system-packages
+- pip3 install adafruit-circuitpython-ht16k33 --break-system-packages (if using the display)
 - i2cdetect -y 1 
 
 
@@ -34,6 +35,15 @@ The MAX30102 requires the following connections:
  - The SDA connected to Pin 3 (GPIO 2)
  - The SCL connected to Pin 5 (GPIO 3)
 
+The 4 Digit Display requires the following connections (optional):
+ - The VIN connected to Pin 17 (3.3V)
+ - The GND connected to Pin 20 (GND)
+ - The SDA connected to Pin 3 (GPIO2)
+ - The SCL connected to Pin 5 (GPIO3)
+
+Due to the Display and MAX30102 using the same pins plug both pins into a pin board then place additional
+jumper wires in the same row and connect them to their respective component
+
  The rest of the Pins should remain unused
 
  The Red LED requires the following connections:
@@ -54,6 +64,10 @@ LED meaning
  - Both off: No usable reading (no finger on the sensor, or still warming up)
 
 Testing:
+
+Run i2cdetect -y 1 before each use of Main.py or any other file that uses an I2C connection to make sure 0x57 and 
+0x70(if using the display) show up, if they are both connected but one is not getting powered it will return an error
+
 
 Run python Button_test.py  to test if the LEDs and Button have been connected correctly
 and will start the flashing the Red and Green LEDs, the command propt will print 

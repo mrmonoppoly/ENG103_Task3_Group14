@@ -15,11 +15,11 @@ Usage from main.py:
 import threading
 import time
 import board
-from adafruit_ht6k32.segments import seg14x4
+from adafruit_ht16k33.segments import Seg14x4
 
-SWITCH_SECONDS = 3.0
+SWITCH_SECONDS = 1.5
 
-class AlernatingDisplay:
+class AlternatingDisplay:
     def __init__(self, monitor, i2c=None, address=0x70, switch_seconds=SWITCH_SECONDS):
         self.monitor = monitor
         self.switch_seconds = switch_seconds
@@ -48,7 +48,7 @@ class AlernatingDisplay:
             if show_bpm:
                 self._show_bpm()
             else:
-                self.show_spo2()
+                self._show_spo2()
             show_bpm = not show_bpm
 
             waited = 0.0
@@ -58,12 +58,14 @@ class AlernatingDisplay:
 
     def _show_bpm(self):
         bpm = self.monitor.bpm
-        text = f"{bpm: .0f}bpm" if bpm is not None else "NA"
+        text = f"B{bpm:.0f}" if bpm is not None else "NA"
+        print(bpm, text)
         self._write(text)
 
     def _show_spo2(self):
-        spo2 = self.monitor.bpm
-        text = f"{spo2: .0f}Sp0" if spo2 is not None else "NA"
+        spo2 = self.monitor.spo2
+        text = f"S{spo2:.1f}" if spo2 is not None else "NA"
+        print(spo2, text)
         self._write(text)
 
     def _write(self, text):
@@ -75,7 +77,7 @@ _display = None
 
 def start_display(monitor, address=0x70, switch_seconds=SWITCH_SECONDS):
     global _display
-    if _diplay is None:
+    if _display is None:
         _display = AlternatingDisplay(monitor, address=address, switch_seconds=switch_seconds)
         _display.start()
     return _display
