@@ -5,6 +5,7 @@ from gpiozero import Button
 from gpiozero import LED
 from datetime import datetime
 from MAX30102 import start_monitoring, stop_monitoring
+from display_loop import start_display
 
 
 APP_KEY = os.environ["DROPBOX_APP_KEY"]
@@ -19,6 +20,7 @@ Green_LED = LED(17)
 
 button = Button(20)
 monitor = start_monitoring()
+display_thread = start_display(monitor)
 
 # Sends the saved data to the txt file
 def button_pressed_action():
@@ -75,4 +77,5 @@ except KeyboardInterrupt:
 finally:
     Red_LED.off()
     Green_LED.off()
+    display_thread.stop()
     stop_monitoring()
