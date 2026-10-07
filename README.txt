@@ -41,7 +41,7 @@ The 4 Digit Display requires the following connections (optional):
  - The SDA connected to Pin 3 (GPIO2)
  - The SCL connected to Pin 5 (GPIO3)
 
-Due to the Display and MAX30102 using the same pins plug both pins into a pin board then place additional
+Due to the Display and MAX30102 using the same GPIO pins, connect both pins into a pin board then place additional
 jumper wires in the same row and connect them to their respective component
 
  The rest of the Pins should remain unused
