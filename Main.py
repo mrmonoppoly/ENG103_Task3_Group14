@@ -6,6 +6,7 @@ from gpiozero import LED
 from datetime import datetime
 from MAX30102 import start_monitoring, stop_monitoring
 from display_loop import start_display
+from flask import Flask, request, render_template
 
 
 APP_KEY = os.environ["DROPBOX_APP_KEY"]
@@ -79,3 +80,25 @@ finally:
     Green_LED.off()
     display_thread.stop()
     stop_monitoring()
+
+
+app = Flask(__name__)
+@app.route('/')
+def login_page():
+    return render_template("login.html")
+
+
+database = {'Admin': 'Pi'}
+app.route('/login.html', methods=['POST', 'GET'])
+def login():
+    name = request.form['username']
+    password = request.form['password']
+    if name not in database:
+        return render_template('login.html', 
+                               info='Invalid User!')
+    else:
+        if database[name] != password:
+            return render_template('login.html', 
+                                   info='Invalid Password!')
+        else:
+            return render_template('main.html', message=message)
